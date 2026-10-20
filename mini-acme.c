@@ -8,8 +8,11 @@
  * mini-acme.c - automatic ACME (RFC 8555) certificate management in pure C.
  *
  * C analog of creating-acme-certificates-with-go (golang.org/x/crypto/acme/autocert):
- *   - obtains and renews RSA 2048 certificates from Let's Encrypt (staging by
- *     default) for one or more domains (SAN), using the "http-01" challenge;
+ *   - obtains and renews RSA 2048 certificates from Let's Encrypt for one or
+ *     more domains (SAN) using the "http-01" challenge; wildcard domains
+ *     (*.example.com) cannot be validated with http-01, so they are validated
+ *     with the "dns-01" challenge (the program prints the required TXT record
+ *     and waits until it becomes publicly resolvable);
  *   - keeps the ACME account key and issued certificates in a local cache
  *     directory (analog of autocert.DirCache("certs"));
  *   - serves the http-01 challenge on port 80 during validation
@@ -23,10 +26,14 @@
  *
  * Usage:
  *   mini-acme [-domain <name>]... [-dir <acme-directory-url>] [-cache <dir>]
- *             [-email <addr>] [-h]
+ *             [-email <addr>] [--apikey <key> --dns <provider>] [-h]
  *
  * Example:
  *   mini-acme -domain example.com -domain www.example.com
+ *   wildcard (TXT record at the DNS provider, printed at runtime):
+ *   mini-acme -domain example.com -domain '*.example.com'
+ *   wildcard with automatic TXT record management (dynadot API):
+ *   mini-acme -domain example.com -domain '*.example.com' --dns dynadot --apikey <key>
  *   for test
  *   mini-acme -domain example.com -dir https://acme-staging-v02.api.letsencrypt.org/directory
  *
@@ -51,6 +58,8 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <errno.h>
 #endif
 
 #define DEFAULT_ACME_DIR  "https://acme-v02.api.letsencrypt.org/directory"
@@ -65,6 +74,10 @@
 
 static volatile int g_stop = 0;
 static char g_domain[256];
+/* Grace period after the dns-01 TXT record is confirmed visible before
+ * accepting the challenge: Let's Encrypt's validators query from other
+ * resolvers that may still cache a negative (NODATA) answer for the name. */
+#define DNS_PROPAGATION_WAIT_SEC 300
 
 /* --- small platform helpers --- */
 
@@ -655,6 +668,9 @@ typedef struct {
     char kid[512];
     char nonce[256];
     int  have_nonce;
+    char api_key[256];
+    char dns_provider[64];
+    int  have_dns_api;
     RSAKey account_key;
     int  have_account_key;
     UrlCtx *http;
@@ -784,7 +800,8 @@ static int acme_request(AcmeClient *ac, const char *req_url, const char *jws_url
     return 0;
 }
 
-/* JWS POST with retries on bad nonce / 429 / 5xx (analog of acme.Client.RetryBackoff). */
+/* JWS POST with retries on bad nonce / 5xx (analog of acme.Client.RetryBackoff).
+ * HTTP 429 (rate limited) is fatal: retrying will not help, the app exits. */
 static int acme_request_retry(AcmeClient *ac, const char *req_url, const char *jws_url,
                               const char *payload, char *resp, int respsz,
                               int *status, char *loc, int locsz) {
@@ -804,7 +821,15 @@ static int acme_request_retry(AcmeClient *ac, const char *req_url, const char *j
             }
             return -1;
         }
-        if (*status == 429 || *status >= 500) {
+        if (*status == 429) {
+            /* Rate limited (e.g. "too many certificates already issued for
+             * this exact set of identifiers ... retry after <time>"):
+             * retrying will not help, exit the application. */
+            acme_log("HTTP 429 rateLimited, exiting.\n");
+            g_stop = 1;
+            return -1;
+        }
+        if (*status >= 500) {
             const char *ra = url_response_header(ac->http, "retry-after");
             int delay = ra ? atoi(ra) : (1 << attempt);
             if (delay < 1) delay = 1;
@@ -964,6 +989,36 @@ static int acme_new_order(AcmeClient *ac, const char *const *domains, int ndomai
     return n;
 }
 
+/* Extract a human-readable error from an invalid authorization: the top-level
+ * "detail" if present, otherwise the error object of the failed challenge
+ * (type + detail), which is where the ACME server puts the real reason. */
+static int authz_error_detail(JsonValue *root, char *out, int outsz) {
+    const char *d = jstr(root, "detail");
+    if (d && *d) {
+        snprintf(out, (size_t)outsz, "%s", d);
+        return 1;
+    }
+    JsonValue *chals = json_get(root, "challenges");
+    if (json_is_array(chals)) {
+        int cnt = json_array_len(chals);
+        for (int i = 0; i < cnt; i++) {
+            JsonValue *c = (JsonValue *)json_array_item(chals, i);
+            if (!json_is_object(c)) continue;
+            const char *cs = jstr(c, "status");
+            if (!cs || strcmp(cs, "invalid") != 0) continue;
+            JsonValue *e = json_get(c, "error");
+            const char *ct = e ? jstr(e, "type") : NULL;
+            const char *cd = e ? jstr(e, "detail") : NULL;
+            if (cd && *cd) {
+                if (ct && *ct) snprintf(out, (size_t)outsz, "%s: %s", ct, cd);
+                else snprintf(out, (size_t)outsz, "%s", cd);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 static int acme_wait_authz(AcmeClient *ac, const char *authz_url) {
     for (int i = 0; i < 60 && !g_stop; i++) {
         char resp[8192];
@@ -976,13 +1031,14 @@ static int acme_wait_authz(AcmeClient *ac, const char *authz_url) {
         if (!st) { json_free_value(root); return -1; }
         if (strcmp(st, "valid") == 0) { json_free_value(root); return 0; }
         if (strcmp(st, "invalid") == 0) {
-            const char *detail = jstr(root, "detail");
-            acme_log("authorization invalid: %s\n", detail ? detail : "unknown");
-            json_free_value(root);
-            return -1;
+            /* The validator may still retry (e.g. a second validation pass);
+             * keep polling until it turns valid or the loop times out. */
+            char det[1024];
+            acme_log("authorization invalid: %s (rechecking...)\n",
+                     authz_error_detail(root, det, sizeof(det)) ? det : "unknown");
         }
         json_free_value(root);
-        msleep(2000);
+        msleep(5000);
     }
     acme_log("authorization timeout\n");
     return -1;
@@ -1037,35 +1093,16 @@ static int chal_lookup(const char *token, char *keyauth, int keyauth_sz) {
 }
 
 /* Satisfy one http-01 challenge (analog of Manager.fulfill + Accept + WaitAuthorization). */
-static int acme_http01(AcmeClient *ac, const char *authz_url, const char *domain) {
-    char resp[8192];
-    int status = 0;
-    if (acme_post_as_get(ac, authz_url, resp, sizeof(resp), &status) != 0) return -1;
-    if (status != 200) return -1;
-    JsonValue *root = jparse(resp);
-    if (!root) return -1;
-    JsonValue *chals = json_get(root, "challenges");
-    const char *token = NULL, *chal_url = NULL;
-    if (json_is_array(chals)) {
-        int cnt = json_array_len(chals);
-        for (int i = 0; i < cnt; i++) {
-            JsonValue *c = (JsonValue *)json_array_item(chals, i);
-            if (!json_is_object(c)) continue;
-            if (strcmp(jstr(c, "type") ? jstr(c, "type") : "", "http-01") != 0) continue;
-            token = jstr(c, "token");
-            chal_url = jstr(c, "url");
-            break;
-        }
-    }
-    if (!token || !chal_url) {
-        acme_log("no http-01 challenge found\n");
-        json_free_value(root);
-        return -1;
-    }
+static int acme_do_http01(AcmeClient *ac, JsonValue *chal, const char *domain,
+                          const char *authz_url) {
+    const char *token = jstr(chal, "token");
+    const char *chal_url = jstr(chal, "url");
+    if (!token || !chal_url) { acme_log("incomplete http-01 challenge\n"); return -1; }
     char token_b[256], chal_url_b[512];
     strncpy(token_b, token, sizeof(token_b) - 1);
+    token_b[sizeof(token_b) - 1] = '\0';
     strncpy(chal_url_b, chal_url, sizeof(chal_url_b) - 1);
-    json_free_value(root);
+    chal_url_b[sizeof(chal_url_b) - 1] = '\0';
 
     char thumb[64];
     if (acme_thumbprint(ac, thumb, sizeof(thumb)) != 0) return -1;
@@ -1073,6 +1110,8 @@ static int acme_http01(AcmeClient *ac, const char *authz_url, const char *domain
     snprintf(keyauth, sizeof(keyauth), "%s.%s", token_b, thumb);
     acme_log("http-01: serving http://%s/.well-known/acme-challenge/%s\n", domain, token_b);
     chal_set(token_b, keyauth);
+    char resp[8192];
+    int status = 0;
     int rc = -1;
     if (acme_request_retry(ac, chal_url_b, chal_url_b, "{}",
                            resp, sizeof(resp), &status, NULL, 0) == 0 &&
@@ -1086,6 +1125,492 @@ static int acme_http01(AcmeClient *ac, const char *authz_url, const char *domain
         json_free_value(r2);
     }
     chal_clear(token_b);
+    return rc;
+}
+
+/* --- dns-01 challenge support (required for wildcard domains) ---
+ *
+ * RFC 8555: a wildcard identifier (e.g. *.example.com) can only be validated
+ * with the dns-01 challenge - Let's Encrypt does not offer http-01 for it.
+ * The validator reads the TXT record _acme-challenge.<domain> (the "*" prefix
+ * dropped). The operator publishes that record in the zone; this program
+ * prints it and polls public resolvers (UDP/53 with a TCP/53 fallback)
+ * until the record is visible. */
+
+/* Walk a DNS response (RFC 1035) and invoke fn for every TXT RDATA
+ * char-string; if fn returns non-zero the walk stops and 1 is returned,
+ * otherwise 0 (including ID mismatch / no TXT answer). */
+static int dns_resp_walk_txt(const uint8_t *resp, int n, uint16_t id,
+                             int (*fn)(const char *txt, void *ctx), void *ctx) {
+    if (n < 12 || resp[0] != (uint8_t)(id >> 8) || resp[1] != (uint8_t)(id & 0xFF)) return 0;
+    uint16_t ancount = (uint16_t)((resp[6] << 8) | resp[7]);
+    int rp = 12, ptr = 0;
+    while (rp < n && resp[rp] != 0x00) {          /* skip question name */
+        if ((resp[rp] & 0xC0) == 0xC0) { rp += 2; ptr = 1; break; }
+        rp += 1 + resp[rp];
+    }
+    if (!ptr && rp < n && resp[rp] == 0x00) rp++;
+    rp += 4;                                      /* QTYPE + QCLASS */
+    for (int a = 0; a < ancount && rp + 12 <= n; a++) {
+        ptr = 0;
+        if ((resp[rp] & 0xC0) == 0xC0) {          /* name compression ptr */
+            rp += 2;
+            ptr = 1;
+        } else {
+            while (rp < n && resp[rp] != 0x00) {
+                if ((resp[rp] & 0xC0) == 0xC0) { rp += 2; ptr = 1; break; }
+                rp += 1 + resp[rp];
+            }
+            if (!ptr && rp < n) rp++;
+        }
+        if (rp + 10 > n) break;
+        uint16_t atype = (uint16_t)((resp[rp] << 8) | resp[rp + 1]);
+        uint16_t rdlen = (uint16_t)((resp[rp + 8] << 8) | resp[rp + 9]);
+        rp += 10;
+        if (rp + rdlen > n) break;
+        if (atype == 0x0010) {                    /* TXT RDATA: char-strings */
+            int sp = rp, se = rp + rdlen;
+            while (sp < se) {
+                int sl = resp[sp++];
+                if (sp + sl > n) sl = n - sp;
+                char txt[512];
+                if (sl >= (int)sizeof(txt)) sl = (int)sizeof(txt) - 1;
+                memcpy(txt, resp + sp, (size_t)sl);
+                txt[sl] = '\0';
+                if (fn(txt, ctx)) return 1;
+                sp += sl;
+            }
+        }
+        rp += rdlen;
+    }
+    return 0;
+}
+
+static int dns_txt_match_fn(const char *txt, void *ctx) {
+    return strcmp(txt, (const char *)ctx) == 0;
+}
+
+typedef struct { char *out; int outsz; } TxtCopyCtx;
+static int dns_txt_copy_fn(const char *txt, void *ctx) {
+    TxtCopyCtx *tc = (TxtCopyCtx *)ctx;
+    snprintf(tc->out, (size_t)tc->outsz, "%s", txt);
+    return 1;
+}
+
+/* Build a DNS TXT query (RFC 1035) for "name"; returns its length or -1. */
+static int dns_build_query(const char *name, uint16_t id, uint8_t *q, int qmax) {
+    int p = 0;
+    q[p++] = (uint8_t)(id >> 8); q[p++] = (uint8_t)(id & 0xFF);
+    q[p++] = 0x01; q[p++] = 0x00;               /* RD set */
+    q[p++] = 0x00; q[p++] = 0x01;               /* QDCOUNT = 1 */
+    q[p++] = 0x00; q[p++] = 0x00;               /* ANCOUNT = 0 */
+    q[p++] = 0x00; q[p++] = 0x00;               /* NSCOUNT = 0 */
+    q[p++] = 0x00; q[p++] = 0x00;               /* ARCOUNT = 0 */
+    const char *dot = name;
+    while (*dot) {
+        const char *next = strchr(dot, '.');
+        int ll = next ? (int)(next - dot) : (int)strlen(dot);
+        if (ll <= 0 || ll > 63 || p + 1 + ll + 5 > qmax) return -1;
+        q[p++] = (uint8_t)ll;
+        memcpy(q + p, dot, (size_t)ll);
+        p += ll;
+        dot = next ? next + 1 : dot + ll;
+    }
+    q[p++] = 0x00;
+    q[p++] = 0x00; q[p++] = 0x10;               /* QTYPE = TXT */
+    q[p++] = 0x00; q[p++] = 0x01;               /* QCLASS = IN */
+    return p;
+}
+
+/* connect() with a timeout (portable: non-blocking connect + select). */
+static int tcp_connect_timeout(SOCKET s, const struct sockaddr_in *sa, int timeout_ms) {
+#ifdef _WIN32
+    u_long nb = 1;
+    if (ioctlsocket(s, FIONBIO, &nb) != 0) return -1;
+#else
+    int fl = fcntl(s, F_GETFL, 0);
+    if (fl < 0) return -1;
+    if (fcntl(s, F_SETFL, fl | O_NONBLOCK) != 0) return -1;
+#endif
+    if (connect(s, (const struct sockaddr *)sa, sizeof(*sa)) != 0) {
+        int err;
+#ifdef _WIN32
+        err = WSAGetLastError();
+        if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS) return -1;
+#else
+        err = errno;
+        if (err != EINPROGRESS) return -1;
+#endif
+        fd_set wf;
+        FD_ZERO(&wf);
+        FD_SET(s, &wf);
+        struct timeval tv = { timeout_ms / 1000, (timeout_ms % 1000) * 1000 };
+        if (select((int)s + 1, NULL, &wf, NULL, &tv) <= 0) return -1;
+        int soerr = 0;
+        socklen_t sl = sizeof(soerr);
+        if (getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&soerr, &sl) != 0 || soerr != 0)
+            return -1;
+    }
+#ifdef _WIN32
+    u_long nb0 = 0;
+    ioctlsocket(s, FIONBIO, &nb0);
+#else
+    fcntl(s, F_SETFL, fl);
+#endif
+    return 0;
+}
+
+/* recv exactly n bytes, waiting for data with select() (SO_RCVTIMEO is
+ * unreliable on Windows after a non-blocking connect). Returns bytes read
+ * or -1 on timeout / error. */
+static int recv_all_timeout(SOCKET s, uint8_t *buf, int n, int timeout_ms) {
+    int got = 0;
+    while (got < n) {
+        fd_set rf;
+        FD_ZERO(&rf);
+        FD_SET(s, &rf);
+        struct timeval tv = { timeout_ms / 1000, (timeout_ms % 1000) * 1000 };
+        if (select((int)s + 1, &rf, NULL, NULL, &tv) <= 0) break;
+        int r = recv(s, (char *)buf + got, n - got, 0);
+        if (r <= 0) break;
+        got += r;
+    }
+    return got;
+}
+
+/* Send a DNS query to one resolver (UDP first, then TCP per RFC 1035 4.2.2
+ * because outbound UDP/53 is frequently blocked). Returns the response
+ * length or -1 on transport error. */
+static int dns_roundtrip(const uint8_t *q, int qlen, const unsigned char ip[4],
+                         uint8_t *resp, int resp_sz) {
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(53);
+    memcpy(&sa.sin_addr.s_addr, ip, 4);
+
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s != INVALID_SOCKET) {
+        struct timeval tv = { 3, 0 };
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+        int n = -1;
+        if (sendto(s, (const char *)q, qlen, 0, (struct sockaddr *)&sa, sizeof(sa)) > 0)
+            n = recv(s, (char *)resp, (size_t)resp_sz, 0);
+        closesocket(s);
+        if (n > 0) return n;
+    }
+
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == INVALID_SOCKET) return -1;
+    int rc = -1;
+    if (tcp_connect_timeout(s, &sa, 5000) == 0) {
+        uint8_t th[2] = { (uint8_t)(qlen >> 8), (uint8_t)(qlen & 0xFF) };
+        if (send(s, (const char *)th, 2, 0) == 2 && send(s, (const char *)q, qlen, 0) == qlen) {
+            if (recv_all_timeout(s, th, 2, 5000) == 2) {
+                int tlen = (th[0] << 8) | th[1];
+                if (tlen > 0 && tlen <= resp_sz &&
+                    recv_all_timeout(s, resp, tlen, 5000) == tlen)
+                    rc = tlen;
+            }
+        }
+    }
+    closesocket(s);
+    return rc;
+}
+
+/* One TXT query against one resolver. Returns 1 if a TXT RR equals
+ * "expected", 0 if the resolver answered but no TXT matched, -1 on
+ * transport error. */
+static int dns_query_resolver(const char *name, const char *expected,
+                              const unsigned char ip[4]) {
+    uint8_t q[512], resp[4096];
+    uint16_t id = (uint16_t)(rand() & 0x7FFF) + 1;
+    int p = dns_build_query(name, id, q, (int)sizeof(q));
+    if (p <= 0) return -1;
+    int n = dns_roundtrip(q, p, ip, resp, (int)sizeof(resp));
+    if (n <= 0) return -1;
+    return dns_resp_walk_txt(resp, n, id, dns_txt_match_fn, (void *)expected) ? 1 : 0;
+}
+
+/* TXT lookup with a list of public resolvers. Returns 1 if any TXT RR of
+ * "name" equals "expected", 0 if the record was queried but did not match,
+ * -1 if all resolvers were unreachable. */
+static int dns_txt_lookup(const char *name, const char *expected) {
+    static const unsigned char ips[3][4] = {
+        { 8, 8, 8, 8 }, { 1, 1, 1, 1 }, { 9, 9, 9, 9 },
+    };
+    int answered = 0;
+    for (int r = 0; r < 3; r++) {
+        int rc = dns_query_resolver(name, expected, ips[r]);
+        if (rc == 1) return 1;
+        if (rc == 0) answered = 1;
+    }
+    return answered ? 0 : -1;
+}
+
+/* Fetch the first TXT value currently published at "name" (any resolver that
+ * has an answer). Returns 1 if found (out filled), 0 if resolvers answered
+ * but the record has no TXT, -1 if all resolvers were unreachable. */
+static int dns_txt_first(const char *name, char *out, int outsz) {
+    static const unsigned char ips[3][4] = {
+        { 8, 8, 8, 8 }, { 1, 1, 1, 1 }, { 9, 9, 9, 9 },
+    };
+    uint8_t q[512], resp[4096];
+    TxtCopyCtx tc = { out, outsz };
+    uint16_t id = (uint16_t)(rand() & 0x7FFF) + 1;
+    int p = dns_build_query(name, id, q, (int)sizeof(q));
+    if (p <= 0) return -1;
+    int answered = 0;
+    for (int r = 0; r < 3; r++) {
+        int n = dns_roundtrip(q, p, ips[r], resp, (int)sizeof(resp));
+        if (n > 0) {
+            answered = 1;
+            if (dns_resp_walk_txt(resp, n, id, dns_txt_copy_fn, &tc)) return 1;
+        }
+    }
+    return answered ? 0 : -1;
+}
+
+/* --- DNS provider API (automated dns-01 TXT record management) ---
+ *
+ * With --dns <provider> --apikey <key> the TXT record is published and
+ * removed via the provider API instead of asking the operator to edit the
+ * zone by hand. Currently the only supported provider is "dynadot"
+ * (API3 set_dns2 command, GET with a query string). */
+
+/* Percent-encode a string for use in a URL query. */
+static void dns_url_encode(const char *s, char *out, int outsz) {
+    static const char hexd[] = "0123456789ABCDEF";
+    int o = 0;
+    for (const char *p = s; *p && o + 3 < outsz; p++) {
+        unsigned char c = (unsigned char)*p;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+            out[o++] = (char)c;
+        } else {
+            out[o++] = '%';
+            out[o++] = hexd[c >> 4];
+            out[o++] = hexd[c & 0x0F];
+        }
+    }
+    out[o] = '\0';
+}
+
+/* One set_dns2 call: publish (record != NULL) or remove (record == NULL)
+ * the TXT record of subdomain "_acme-challenge" of "domain" without
+ * touching the rest of the zone (add_dns_to_current_setting=1).
+ * Returns 0 on ResponseCode "0" / Status "success", -1 otherwise. */
+static int dynadot_set_acme_txt(const AcmeClient *ac, const char *domain, const char *record) {
+    char key_e[768], dom_e[768], rec_e[1536], url[4096];
+    dns_url_encode(ac->api_key, key_e, sizeof(key_e));
+    dns_url_encode(domain, dom_e, sizeof(dom_e));
+    int ul;
+    if (record) {
+        dns_url_encode(record, rec_e, sizeof(rec_e));
+        ul = snprintf(url, sizeof(url),
+                 "https://api.dynadot.com/api3.json"
+                 "?key=%s&command=set_dns2&domain=%s"
+                 "&subdomain0=_acme-challenge&sub_record_type0=txt"
+                 "&sub_record0=%s&add_dns_to_current_setting=1&ttl=300",
+                 key_e, dom_e, rec_e);
+    } else {
+        ul = snprintf(url, sizeof(url),
+                 "https://api.dynadot.com/api3.json"
+                 "?key=%s&command=set_dns2&domain=%s"
+                 "&subdomain0=_acme-challenge&sub_record_type0=none"
+                 "&sub_record0=&add_dns_to_current_setting=1",
+                 key_e, dom_e);
+    }
+    if (ul < 0 || ul >= (int)sizeof(url)) return -1;
+    /* Plain GET: make sure no stale POST body/content-type is reused. */
+    url_set_data(ac->http, NULL, 0);
+    url_set_content_type(ac->http, NULL);
+    char *body = url_run(ac->http, url, "GET", NULL);
+    int st = url_status(ac->http);
+    int ok = 0;
+    if (body && st == 200) {
+        JsonValue *root = jparse(body);
+        JsonValue *r = root ? json_get(root, "SetDnsResponse") : NULL;
+        JsonValue *codev = r ? json_get(r, "ResponseCode") : NULL;
+        const char *status = r ? jstr(r, "Status") : NULL;
+        /* Dynadot reports ResponseCode as a JSON number (0) on success and as
+         * a string ("-1") on some errors; accept either representation. */
+        int code_zero = 0;
+        if (codev) {
+            if (json_is_string(codev)) code_zero = (strcmp(json_string(codev), "0") == 0);
+            else if (json_is_number(codev)) code_zero = (json_number(codev) == 0.0);
+        }
+        ok = (code_zero && status && strcmp(status, "success") == 0);
+        /* Removing a record that does not exist is a benign no-op: Dynadot
+         * answers "no record for subdomain0"; do not treat that as a failure. */
+        if (!ok && !record) {
+            const char *err = r ? jstr(r, "Error") : NULL;
+            if (err && strstr(err, "no record")) ok = 1;
+        }
+        json_free_value(root);
+    }
+    if (!ok) {
+        acme_log("dynadot: %s failed (HTTP %d, transport error %d): %.300s\n",
+                 record ? "set TXT" : "remove TXT", st, ac->http->last_error,
+                 body ? body : "no response");
+    }
+    free(body);
+    return ok ? 0 : -1;
+}
+
+/* Satisfy one dns-01 challenge: publish the required TXT record (via the
+ * provider API when --dns/--apikey are given, otherwise printed for the
+ * operator), wait until it is publicly resolvable, accept the challenge,
+ * then remove the record again. */
+static int acme_do_dns01(AcmeClient *ac, JsonValue *chal, const char *domain,
+                         const char *authz_url) {
+    const char *token = jstr(chal, "token");
+    const char *chal_url = jstr(chal, "url");
+    if (!token || !chal_url) { acme_log("incomplete dns-01 challenge\n"); return -1; }
+    char token_b[256], chal_url_b[512];
+    strncpy(token_b, token, sizeof(token_b) - 1);
+    token_b[sizeof(token_b) - 1] = '\0';
+    strncpy(chal_url_b, chal_url, sizeof(chal_url_b) - 1);
+    chal_url_b[sizeof(chal_url_b) - 1] = '\0';
+
+    char thumb[64];
+    if (acme_thumbprint(ac, thumb, sizeof(thumb)) != 0) return -1;
+    char keyauth[512];
+    snprintf(keyauth, sizeof(keyauth), "%s.%s", token_b, thumb);
+    uint8_t hash[32];
+    SHA256State sha;
+    sha256_init(&sha);
+    sha256_process(&sha, (const uint8_t *)keyauth, (int)strlen(keyauth));
+    sha256_done(&sha, hash);
+    char digest[64];
+    if (b64url_encode(hash, 32, digest, sizeof(digest)) < 0) return -1;
+
+    const char *base = domain;
+    if (strncmp(base, "*.", 2) == 0) base += 2;
+    char recname[300];
+    snprintf(recname, sizeof(recname), "_acme-challenge.%s", base);
+
+    int record_added = 0, ok = 0, rc = -1;
+    if (ac->have_dns_api) {
+        /* Automated mode: first clear any stale record left by a previous
+         * run (leftovers break validation), then publish the new one. */
+        acme_log("dynadot: removing stale TXT record %s (if any)...\n", recname);
+        if (dynadot_set_acme_txt(ac, base, NULL) != 0)
+            acme_log("dynadot: warning: stale record may not have been removed\n");
+        acme_log("dynadot: adding TXT record %s via API...\n", recname);
+        if (dynadot_set_acme_txt(ac, base, digest) != 0) {
+            acme_log("dns-01: aborting: failed to publish TXT record via dynadot API\n");
+            return -1;
+        }
+        record_added = 1;
+        acme_log("dns-01: TXT record published, waiting for it to become visible (polling every 10 s, up to 15 min)...\n");
+    } else {
+        /* Leftover records from previous (failed) runs break validation: the
+         * validator rejects the challenge if ANY of the TXT values differs. */
+        char cur[512] = { 0 };
+        if (dns_txt_first(recname, cur, sizeof(cur)) == 1 && strcmp(cur, digest) != 0) {
+            acme_log("dns-01: WARNING: %s already has TXT value \"%s\"\n", recname, cur);
+            acme_log("dns-01: remove ALL old TXT records for %s first, then add the new one\n", recname);
+        }
+        acme_log("dns-01: add this TXT record to the zone of %s:\n", base);
+        printf("[acme]   name:  %s\n", recname);
+        printf("[acme]   value: %s\n", digest);
+        acme_log("dns-01: waiting for the TXT record (polling every 10 s, up to 15 min)...\n");
+    }
+    for (int i = 0; i < 90 && !g_stop; i++) {
+        if (dns_txt_lookup(recname, digest) == 1) {
+            /* confirm once more (10 s later) so the record is stable on the
+             * authoritative nameservers before the validator runs */
+            msleep(10000);
+            if (!g_stop && dns_txt_lookup(recname, digest) == 1) { ok = 1; break; }
+        }
+        msleep(10000);
+    }
+    if (!ok) {
+        acme_log("dns-01: TXT record %s not visible, aborting\n", recname);
+    } else {
+        acme_log("dns-01: TXT record confirmed, waiting %d s for propagation to other resolvers...\n",
+                 DNS_PROPAGATION_WAIT_SEC);
+        for (int w = 0; w < DNS_PROPAGATION_WAIT_SEC * 10 && !g_stop; w++) msleep(100);
+        acme_log("dns-01: accepting challenge...\n");
+        char resp[8192];
+        int status = 0;
+        if (acme_request_retry(ac, chal_url_b, chal_url_b, "{}",
+                               resp, sizeof(resp), &status, NULL, 0) == 0 &&
+            (status == 200 || status == 202)) {
+            acme_log("challenge accepted, waiting for validation...\n");
+            rc = acme_wait_authz(ac, authz_url);
+        } else {
+            JsonValue *r2 = jparse(resp);
+            const char *detail = jstr(r2, "detail");
+            acme_log("challenge accept failed (HTTP %d): %s\n", status, detail ? detail : resp);
+            json_free_value(r2);
+        }
+    }
+    if (record_added) {
+        /* Always clean up the record we published (success or failure),
+         * otherwise it becomes a stale record for the next run. */
+        acme_log("dynadot: removing TXT record %s...\n", recname);
+        if (dynadot_set_acme_txt(ac, base, NULL) == 0)
+            acme_log("dynadot: TXT record removed\n");
+        else
+            acme_log("dynadot: WARNING: failed to remove the TXT record, remove it manually at the DNS provider\n");
+    } else if (rc == 0) {
+        acme_log("dns-01: challenge validated, you can remove the TXT record %s now\n", recname);
+    }
+    return rc;
+}
+
+/* Satisfy one authorization: http-01 when offered, otherwise dns-01
+ * (wildcard identifiers only get dns-01). Uses the identifier from the
+ * authorization response, not the request order. */
+static int acme_satisfy_authz(AcmeClient *ac, const char *authz_url, const char *fallback_domain) {
+    char resp[8192];
+    int status = 0;
+    if (acme_post_as_get(ac, authz_url, resp, sizeof(resp), &status) != 0) return -1;
+    if (status != 200) return -1;
+    JsonValue *root = jparse(resp);
+    if (!root) return -1;
+    const char *st = jstr(root, "status");
+    if (!st) { json_free_value(root); return -1; }
+    const char *domain = jstr(json_get(root, "identifier"), "value");
+    if (!domain || !*domain) domain = fallback_domain;
+    char domain_b[256];
+    strncpy(domain_b, domain, sizeof(domain_b) - 1);
+    domain_b[sizeof(domain_b) - 1] = '\0';
+    if (strcmp(st, "valid") == 0) {
+        acme_log("authorization for %s already valid\n", domain_b);
+        json_free_value(root);
+        return 0;
+    }
+    if (strcmp(st, "invalid") == 0) {
+        char det[1024];
+        acme_log("authorization invalid: %s\n",
+                 authz_error_detail(root, det, sizeof(det)) ? det : "unknown");
+        json_free_value(root);
+        return -1;
+    }
+    JsonValue *chals = json_get(root, "challenges");
+    JsonValue *http_c = NULL, *dns_c = NULL;
+    if (json_is_array(chals)) {
+        int cnt = json_array_len(chals);
+        for (int i = 0; i < cnt; i++) {
+            JsonValue *c = (JsonValue *)json_array_item(chals, i);
+            if (!json_is_object(c)) continue;
+            const char *t = jstr(c, "type");
+            if (!t) continue;
+            if (strcmp(t, "http-01") == 0 && !http_c) http_c = c;
+            else if (strcmp(t, "dns-01") == 0 && !dns_c) dns_c = c;
+        }
+    }
+    if (!http_c && !dns_c) {
+        acme_log("no http-01 or dns-01 challenge found for %s\n", domain_b);
+        json_free_value(root);
+        return -1;
+    }
+    int rc = http_c ? acme_do_http01(ac, http_c, domain_b, authz_url)
+                    : acme_do_dns01(ac, dns_c, domain_b, authz_url);
+    json_free_value(root);
     return rc;
 }
 
@@ -1214,20 +1739,7 @@ static int acme_create_cert(AcmeClient *ac, const char *const *domains, int ndom
         acme_log("warning: order has %d authorizations for %d domains\n", nauthz, ndomains);
 
     for (int i = 0; i < nauthz && !g_stop; i++) {
-        const char *dlg = domains[i < ndomains ? i : 0];
-        char resp[8192];
-        int status = 0;
-        if (acme_post_as_get(ac, authz[i], resp, sizeof(resp), &status) == 0 && status == 200) {
-            JsonValue *root = jparse(resp);
-            const char *st = root ? jstr(root, "status") : NULL;
-            int already_valid = st && strcmp(st, "valid") == 0;
-            json_free_value(root);
-            if (already_valid) {
-                acme_log("authorization %d (%s) already valid\n", i + 1, dlg);
-                continue;
-            }
-        }
-        if (acme_http01(ac, authz[i], dlg) != 0) return -1;
+        if (acme_satisfy_authz(ac, authz[i], domains[i < ndomains ? i : 0]) != 0) return -1;
     }
 
     if (acme_wait_order(ac, order_url) != 0) return -1;
@@ -1443,17 +1955,26 @@ static void print_help(FILE *out, const char *prog) {
     fprintf(out,
         "mini-acme - automatic ACME (Let's Encrypt) certificate management in pure C.\n"
         "\n"
-        "Usage:\n"
-        "  %s [-domain <name>]... [-dir <acme-directory-url>] [-cache <dir>] [-email <addr>] [-h]\n"
-        "\n"
-        "Arguments:\n"
-        "  -domain <name>   Domain to include in the certificate (repeatable, up to %d).\n"
-        "                   The first -domain is the primary (CN + cache file name),\n"
-        "                   all are listed in SAN. Every domain must be publicly\n"
-        "                   resolvable for http-01 validation.\n"
-        "  -dir <url>       ACME directory URL (default: Let's Encrypt staging:\n"
-        "                   https://acme-staging-v02.api.letsencrypt.org/directory).\n"
-        "                   Production: https://acme-v02.api.letsencrypt.org/directory\n"
+         "Usage:\n"
+         "  %s [-domain <name>]... [-dir <acme-directory-url>] [-cache <dir>] [-email <addr>]\n"
+         "      [--apikey <key> --dns <provider>] [-h]\n"
+         "\n"
+         "Arguments:\n"
+         "  -domain <name>   Domain to include in the certificate (repeatable, up to %d).\n"
+         "                   The first -domain is the primary (CN + cache file name),\n"
+         "                   all are listed in SAN. Every domain must be publicly\n"
+         "                   resolvable for http-01 validation. Wildcard domains\n"
+         "                   (*.example.com) are validated via dns-01 instead: the\n"
+         "                   required TXT record (_acme-challenge.*) is published and\n"
+         "                   removed automatically when --dns/--apikey are given,\n"
+         "                   otherwise it is printed and you add it at the DNS provider.\n"
+         "  --apikey <key>   API key of the DNS provider (--dns). The two options\n"
+         "                   must be given together.\n"
+          "  --dns <provider> DNS provider for the automatic TXT record management.\n"
+          "                   Supported: dynadot.\n"
+         "  -dir <url>       ACME directory URL (default: Let's Encrypt production:\n"
+         "                   https://acme-v02.api.letsencrypt.org/directory).\n"
+         "                   Staging: https://acme-staging-v02.api.letsencrypt.org/directory\n"
         "  -cache <dir>     Certificate cache directory (default: certs).\n"
         "  -email <addr>    Contact email for the ACME account (default: admin@example.com).\n"
         "  -h, -help        Show this help.\n"
@@ -1461,15 +1982,18 @@ static void print_help(FILE *out, const char *prog) {
         "The program serves the http-01 challenge on port 80, obtains an RSA\n"
         "certificate and saves it to the cache directory, then exits.\n"
         "A cached certificate is reused if it is valid for more than 30 days.\n"
-        "\n"
-        "Example:\n"
-        "  %s -domain example.com -domain www.example.com\n",
-        prog, MAX_DOMAINS, prog);
+         "\n"
+         "Example:\n"
+         "  %s -domain example.com -domain www.example.com\n"
+         "  %s -domain example.com -domain '*.example.com'   (wildcard: dns-01)\n"
+         "  %s -domain example.com -domain '*.example.com' --dns dynadot --apikey <key>\n",
+         prog, MAX_DOMAINS, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     const char *dir_url = NULL, *cache = NULL, *email = NULL;
+    const char *api_key = NULL, *dns_provider = NULL;
     const char *domains[MAX_DOMAINS];
     int ndomains = 0;
     char hostbuf[256];
@@ -1501,11 +2025,30 @@ int main(int argc, char **argv) {
         } else if (strcmp(a, "-email") == 0) {
             if (i + 1 >= argc) { fprintf(stderr, "Error: no email specified for -email\n"); return 1; }
             email = argv[++i];
+        } else if (strcmp(a, "--apikey") == 0 || strcmp(a, "-apikey") == 0) {
+            if (i + 1 >= argc) { fprintf(stderr, "Error: no API key specified for --apikey\n"); return 1; }
+            api_key = argv[++i];
+        } else if (strcmp(a, "--dns") == 0 || strcmp(a, "-dns") == 0) {
+            if (i + 1 >= argc) { fprintf(stderr, "Error: no provider specified for --dns\n"); return 1; }
+            dns_provider = argv[++i];
         } else {
             fprintf(stderr, "Error: unknown argument \"%s\"\n", a);
             print_help(stderr, argv[0]);
             return 1;
         }
+    }
+
+    if ((api_key != NULL) != (dns_provider != NULL)) {
+        fprintf(stderr, "Error: --apikey and --dns must be given together\n");
+        return 1;
+    }
+    if (api_key && !*api_key) {
+        fprintf(stderr, "Error: empty --apikey\n");
+        return 1;
+    }
+    if (api_key && strcmp(dns_provider, "dynadot") != 0) {
+        fprintf(stderr, "Error: unsupported DNS provider \"%s\" (supported: dynadot)\n", dns_provider);
+        return 1;
     }
 
     if (ndomains == 0) {
@@ -1527,6 +2070,12 @@ int main(int argc, char **argv) {
     }
 
     acme_init(&g_acme, dir_url, cache, email);
+    if (api_key) {
+        snprintf(g_acme.api_key, sizeof(g_acme.api_key), "%s", api_key);
+        snprintf(g_acme.dns_provider, sizeof(g_acme.dns_provider), "%s", dns_provider);
+        g_acme.have_dns_api = 1;
+        printf("DNS provider: %s (automatic TXT record management)\n", dns_provider);
+    }
     ensure_dir(g_acme.cache_dir);
     mtx_init(&g_chal_lock);
 
